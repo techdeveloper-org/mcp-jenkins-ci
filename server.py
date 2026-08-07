@@ -44,12 +44,55 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+
+try:
+    from mcp.types import ToolAnnotations
+except ImportError:  # pragma: no cover - annotations unsupported on this mcp
+    ToolAnnotations = None
+
 from base.decorators import mcp_tool_handler
+from idempotency import run_once
 
 mcp = MCPServer(
     "jenkins-ci",
     instructions="Jenkins CI/CD integration via REST API (stdlib only, no external deps)"
 )
+
+
+def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
+    """Register a tool with explicit MCP ToolAnnotations.
+
+    The MCP specification's per-hint defaults are readOnlyHint=false,
+    destructiveHint=true, idempotentHint=false and openWorldHint=true -- every
+    default points at the more dangerous value, so an unannotated tool is
+    indistinguishable from an explicit worst-case declaration. Every tool on
+    this server declares its four hints explicitly so a host's auto-approval and
+    automatic-retry decisions rest on a stated property rather than an omission.
+
+    Args:
+        read_only: True when the tool has no side effects at all.
+        destructive: True when the tool's effect is irreversible.
+        idempotent: True only when repeating the call with identical arguments
+            leaves the same cumulative effect as a single call.
+        open_world: True when the tool reaches an external system.
+
+    Returns:
+        The decorator returned by the underlying MCP tool registration.
+    """
+    if ToolAnnotations is None:
+        return mcp.tool()
+    try:
+        return mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                openWorldHint=open_world,
+            )
+        )
+    except TypeError:  # pragma: no cover - older mcp without annotations kwarg
+        return mcp.tool()
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -148,9 +191,11 @@ def _jenkins_request(
             return body, resp.status
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        detail = body.strip()[:500]
+        message = exc.msg if not detail else "{}: {}".format(exc.msg, detail)
         raise urllib.error.HTTPError(
-            exc.url, exc.code, exc.msg, exc.headers, None
-        ) from None
+            exc.url, exc.code, message, exc.headers, None
+        ) from exc
 
 
 def _jenkins_json(path: str) -> dict:
@@ -167,56 +212,127 @@ def _jenkins_json(path: str) -> dict:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+def _encode_build_parameters(parameters: str) -> str:
+    """Normalise caller-supplied build parameters into a safe query string.
+
+    Accepts either a JSON object (``{"BRANCH": "release/1.0 rc"}``) or a
+    ``KEY=value&KEY2=value2`` string, and re-encodes both. The previous
+    implementation interpolated the caller's string straight into the request
+    URL, so any value containing '&', '=', '#' or a space either broke the
+    request or silently smuggled additional query parameters into it. The JSON
+    form is the safer of the two because a value may then contain any character
+    without being mistaken for a delimiter.
+
+    Args:
+        parameters: JSON object string, or a KEY=value query string.
+
+    Returns:
+        A properly percent-encoded query string.
+
+    Raises:
+        ValueError: If a JSON payload is not an object of scalar values, or if
+            the string form contains no usable key=value pair.
+    """
+    stripped = parameters.strip()
+
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                "parameters looked like JSON but could not be parsed: {}".format(exc)
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON parameters must be an object of key/value pairs")
+        pairs = []
+        for key, value in parsed.items():
+            if isinstance(value, (dict, list)):
+                raise ValueError(
+                    "Build parameter '{}' must be a scalar value".format(key)
+                )
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            pairs.append((str(key), "" if value is None else str(value)))
+    else:
+        pairs = urllib.parse.parse_qsl(stripped, keep_blank_values=True)
+        if not pairs:
+            raise ValueError(
+                "parameters must be a JSON object or a 'KEY=value&KEY2=value2' "
+                "query string"
+            )
+
+    return urllib.parse.urlencode(pairs)
+
+
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
 @mcp_tool_handler
 def jenkins_trigger_build(
     job_name: str,
     parameters: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
     """Trigger a Jenkins build for the specified job.
 
     Uses /build for parameterless jobs and /buildWithParameters when
     parameters are provided.
 
+    Triggering a build is not idempotent and Jenkins offers no de-duplication
+    of its own: a retry issued after a lost response queues a second build,
+    which may redeploy or otherwise act on the world a second time. Supply
+    ``idempotency_key`` -- generated once when you decide to trigger the build,
+    and reused unchanged on every retry of that same decision -- so a repeat
+    call replays the recorded queue item instead of queueing another build. A
+    key regenerated per attempt provides no protection at all.
+
     Args:
         job_name: Job name or folder path (e.g., 'my-job' or 'folder/my-job').
-        parameters: Optional query string of build parameters
-                    (e.g., 'BRANCH=main&ENV=staging').
-                    Each param is a key=value pair separated by '&'.
+        parameters: Optional build parameters, either as a JSON object
+                    ('{"BRANCH": "main", "ENV": "staging"}') or as a query
+                    string ('BRANCH=main&ENV=staging'). Values are
+                    percent-encoded before the request is sent. Prefer the JSON
+                    form when a value may contain '&', '=', '#' or a space.
+        idempotency_key: Optional caller-generated key scoped to one logical
+                    build-trigger intent.
 
     Returns:
         dict with queued=True, queue_url (Location header), and job_name.
     """
-    job_path = _encode_job_path(job_name)
+    def _trigger() -> dict:
+        """Perform the underlying non-idempotent build trigger."""
+        job_path = _encode_job_path(job_name)
 
-    if parameters:
-        endpoint = "{}/buildWithParameters?{}".format(job_path, parameters)
-    else:
-        endpoint = "{}/build".format(job_path)
+        if parameters:
+            endpoint = "{}/buildWithParameters?{}".format(
+                job_path, _encode_build_parameters(parameters)
+            )
+        else:
+            endpoint = "{}/build".format(job_path)
 
-    url = _base_url() + endpoint
-    headers = {"Authorization": _build_auth_header()}
-    req = urllib.request.Request(
-        url, data=b"", headers=headers, method="POST"
-    )
-    ssl_ctx = _ssl_context()
+        url = _base_url() + endpoint
+        headers = {"Authorization": _build_auth_header()}
+        req = urllib.request.Request(
+            url, data=b"", headers=headers, method="POST"
+        )
+        ssl_ctx = _ssl_context()
 
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT, context=ssl_ctx) as resp:
-            queue_url = resp.headers.get("Location", "")
-            return {
-                "queued": True,
-                "job_name": job_name,
-                "queue_url": queue_url,
-                "status_code": resp.status,
-            }
-    except urllib.error.HTTPError as exc:
-        raise ValueError(
-            "Jenkins returned HTTP {}: {}".format(exc.code, exc.reason)
-        ) from exc
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT, context=ssl_ctx) as resp:
+                queue_url = resp.headers.get("Location", "")
+                return {
+                    "queued": True,
+                    "job_name": job_name,
+                    "queue_url": queue_url,
+                    "status_code": resp.status,
+                }
+        except urllib.error.HTTPError as exc:
+            raise ValueError(
+                "Jenkins returned HTTP {}: {}".format(exc.code, exc.reason)
+            ) from exc
+
+    return run_once("jenkins_trigger_build", idempotency_key, _trigger)
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_get_build_status(
     job_name: str,
@@ -250,7 +366,7 @@ def jenkins_get_build_status(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_get_console_output(
     job_name: str,
@@ -286,7 +402,7 @@ def jenkins_get_console_output(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_list_jobs(
     folder: Optional[str] = None,
@@ -327,7 +443,7 @@ def jenkins_list_jobs(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_get_job_info(
     job_name: str,
@@ -376,7 +492,7 @@ def jenkins_get_job_info(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_list_builds(
     job_name: str,
@@ -419,7 +535,7 @@ def jenkins_list_builds(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=True, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_abort_build(
     job_name: str,
@@ -457,7 +573,7 @@ def jenkins_abort_build(
         ) from exc
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_get_queue_info() -> dict:
     """Get the current Jenkins build queue status.
@@ -489,7 +605,7 @@ def jenkins_get_queue_info() -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_wait_for_build(
     job_name: str,
@@ -550,7 +666,7 @@ def jenkins_wait_for_build(
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def jenkins_health_check() -> dict:
     """Verify Jenkins connectivity and return basic server information.
