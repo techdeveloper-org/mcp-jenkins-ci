@@ -1,0 +1,35 @@
+{
+  "schema": "library-project-sync-v1",
+  "library": {
+    "name": "claude-global-library",
+    "version": "29.82.1"
+  },
+  "agents": [
+    "devops-engineer",
+    "release-engineering-specialist"
+  ],
+  "skills": [
+    "docker",
+    "github-actions-ci",
+    "jenkins-pipeline",
+    "kubernetes",
+    "linux-shell-scripting",
+    "logging-patterns",
+    "release-versioning-management-core",
+    "system-design",
+    "testing-core"
+  ],
+  "managed_files": [
+    ".claude/agents/devops-engineer.md",
+    ".claude/agents/release-engineering-specialist.md",
+    ".claude/skills/docker/SKILL.md",
+    ".claude/skills/github-actions-ci/SKILL.md",
+    ".claude/skills/jenkins-pipeline/SKILL.md",
+    ".claude/skills/kubernetes/SKILL.md",
+    ".claude/skills/linux-shell-scripting/SKILL.md",
+    ".claude/skills/logging-patterns/SKILL.md",
+    ".claude/skills/release-versioning-management-core/SKILL.md",
+    ".claude/skills/system-design/SKILL.md",
+    ".claude/skills/testing-core/SKILL.md"
+  ]
+}
