@@ -2,11 +2,11 @@
 
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
+![Part of ai-native-sdlc-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-orange)
 
 A FastMCP server that gives Claude direct access to Jenkins CI/CD via the Jenkins REST API. Trigger builds, stream console output, manage the build queue, poll build status, and abort running builds — all over stdio JSON-RPC with no external Python dependencies beyond FastMCP itself.
 
-This server is one of 13 MCP servers in the [claude-workflow-engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem. When enabled, it gates pull request merges in Step 11 of the pipeline on a successful Jenkins build.
+This server is one of 13 MCP servers in the [ai-native-sdlc-engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine) ecosystem. When enabled, it gates pull request merges in Step 11 of the pipeline on a successful Jenkins build.
 
 ---
 
@@ -96,7 +96,7 @@ The server reads four environment variables at startup. Set them in the `env` bl
 | `JENKINS_API_TOKEN` | Yes | — | Jenkins API token (not your password). Tokens bypass CSRF crumb requirements. Generate one at `<JENKINS_URL>/user/<username>/configure`. |
 | `JENKINS_VERIFY_SSL` | No | `true` | Set to `false` to skip SSL verification for self-signed certificates |
 
-To enable this server within the claude-workflow-engine pipeline, also set:
+To enable this server within the ai-native-sdlc-engine pipeline, also set:
 
 ```bash
 ENABLE_JENKINS=1
@@ -165,7 +165,7 @@ Polls every 5 seconds. Returns `result`, `timed_out`, and `elapsed_seconds` when
 
 ## Pipeline Integration
 
-When `ENABLE_JENKINS=1`, this server participates in **Step 11** of the claude-workflow-engine pipeline (PR creation and code review).
+When `ENABLE_JENKINS=1`, this server participates in **Step 11** of the ai-native-sdlc-engine pipeline (PR creation and code review).
 
 **Step 11 flow with Jenkins enabled:**
 
@@ -179,9 +179,9 @@ This pattern ensures no PR is merged without a passing Jenkins build. The build 
 
 ---
 
-## Part of the claude-workflow-engine Ecosystem
+## Part of the ai-native-sdlc-engine Ecosystem
 
-This server is one of 13 MCP servers used by [claude-workflow-engine](https://github.com/techdeveloper-org/claude-workflow-engine), a LangGraph orchestration pipeline for automating Claude Code development workflows.
+This server is one of 13 MCP servers used by [ai-native-sdlc-engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine), a LangGraph orchestration pipeline for automating Claude Code development workflows.
 
 | # | Server | Purpose |
 |---|--------|---------|
